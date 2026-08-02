@@ -437,11 +437,9 @@ if ( $prefetch_data_total != 0 ) {
 	$data_prefetch_percent = $prefetch_data_hits / $prefetch_data_total * 100;
 }
 
-my $anon_hits_percent;
-if ( $anon_hits != 0 ) {
+my $anon_hits_percent = 0;
+if ( $arc_hits != 0 ) {
 	$anon_hits_percent = $anon_hits / $arc_hits * 100;
-} else {
-	$anon_hits_percent = 0;
 }
 
 my $mru_percent                    = 0;
