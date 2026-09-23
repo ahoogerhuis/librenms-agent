@@ -89,6 +89,52 @@ sub main::HELP_MESSAGE {
 	pod2usage( -exitval => 255, -verbose => 2, -output => \*STDOUT, );
 }
 
+my %iostat_top_label_span = (
+	capacity        => 2, operations   => 2, bandwidth      => 2,
+	total_wait      => 2, disk_wait    => 2, syncq_wait     => 2,
+	asyncq_wait     => 2, scrub        => 1, trim           => 1,
+	rebuild         => 1, syncq_read   => 2, syncq_write    => 2,
+	asyncq_read     => 2, asyncq_write => 2, scrubq_read    => 2,
+	trimq_write     => 2, rebuildq_write => 2,
+);
+
+sub parse_iostat_header {
+	my ( $top_line, $bottom_line, $dash_line ) = @_;
+
+	my @col_ranges;
+	while ( $dash_line =~ /(-+)/g ) {
+		push @col_ranges, [ $-[1], $+[1] ];
+	}
+
+	my @bottom;
+	foreach my $r (@col_ranges) {
+		my $s = substr( $bottom_line, $r->[0], $r->[1] - $r->[0] );
+		$s =~ s/^\s+|\s+$//g;
+		push @bottom, $s;
+	}
+
+	my @top_tokens;
+	while ( $top_line =~ /(\S+)/g ) {
+		push @top_tokens, $1;
+	}
+	my @top_for_col = ('');
+	foreach my $t (@top_tokens) {
+		my $span = $iostat_top_label_span{$t} // 1;
+		push @top_for_col, ($t) x $span;
+	}
+
+	if ( scalar(@top_for_col) != scalar(@col_ranges) ) {
+		return ( [ map { "field_$_" } 0 .. $#col_ranges ], \@col_ranges );
+	}
+
+	my @combined;
+	foreach my $i ( 0 .. $#col_ranges ) {
+		push @combined, ( $top_for_col[$i] eq '' ? $bottom[$i] : $top_for_col[$i] . '_' . $bottom[$i] );
+	}
+
+	return ( \@combined, \@col_ranges );
+}
+
 #this will be dumped to json at the end
 my %tojson;
 
@@ -191,24 +237,41 @@ while ( defined( $pools[$pools_int] ) ) {
 		$newPool{expandsz} = 0;
 	}
 
-	my $iostat = `zpool iostat -l -q -p -H $newPool{name}`;
-	chomp($iostat);
-	$iostat =~ s/\t+/,/g;
-	$iostat =~ s/\,\-\,\-\,/\,0\,0\,/g;
-	$iostat =~ s/\%//g;
-	$iostat =~ s/\,([0-1\.]*)x\,/,$1,/;
-	chomp($iostat);
-	my $parsed;
-	(
-		$parsed,                  $parsed,                 $parsed,                 $newPool{operations_r},
-		$newPool{operations_w},   $newPool{bandwidth_r},   $newPool{bandwidth_w},   $newPool{total_wait_r},
-		$newPool{total_wait_w},   $newPool{disk_wait_r},   $newPool{disk_wait_w},   $newPool{syncq_wait_r},
-		$newPool{syncq_wait_w},   $newPool{asyncq_wait_r}, $newPool{asyncq_wait_w}, $newPool{scrub_wait},
-		$newPool{trim_wait},      $newPool{syncq_read_p},  $newPool{syncq_read_a},  $newPool{syncq_write_p},
-		$newPool{syncq_write_a},  $newPool{asyncq_read_p}, $newPool{asyncq_read_a}, $newPool{asyncq_write_p},
-		$newPool{asyncq_write_a}, $newPool{scrubq_read_p}, $newPool{scrubq_read_a}, $newPool{trimq_write_p},
-		$newPool{trimq_write_a},
-	) = split( /\,/, $iostat );
+	my $iostat_output = `zpool iostat -y -l -q -p $newPool{name} 2 1`;
+	my @iostat_lines  = split( /\n/, $iostat_output );
+	my ( $iostat_top_line, $iostat_bottom_line, $iostat_dash_line, $iostat_data_line ) = @iostat_lines;
+
+	my ( $iostat_field_names, $iostat_field_ranges ) = parse_iostat_header( $iostat_top_line, $iostat_bottom_line, $iostat_dash_line );
+
+	my %iostat_raw;
+	foreach my $i ( 0 .. $#$iostat_field_names ) {
+		my ( $s, $e ) = @{ $iostat_field_ranges->[$i] };
+		my $v = substr( $iostat_data_line, $s, $e - $s );
+		$v =~ s/^\s+|\s+$//g;
+		$iostat_raw{ $iostat_field_names->[$i] } = $v;
+	}
+
+	my %iostat_field_alias = (
+		operations_read    => 'operations_r',   operations_write   => 'operations_w',
+		bandwidth_read     => 'bandwidth_r',    bandwidth_write    => 'bandwidth_w',
+		total_wait_read    => 'total_wait_r',   total_wait_write   => 'total_wait_w',
+		disk_wait_read     => 'disk_wait_r',    disk_wait_write    => 'disk_wait_w',
+		syncq_wait_read    => 'syncq_wait_r',   syncq_wait_write   => 'syncq_wait_w',
+		asyncq_wait_read   => 'asyncq_wait_r',  asyncq_wait_write  => 'asyncq_wait_w',
+		scrub_wait         => 'scrub_wait',     trim_wait          => 'trim_wait',
+		syncq_read_pend    => 'syncq_read_p',   syncq_read_activ   => 'syncq_read_a',
+		syncq_write_pend   => 'syncq_write_p',  syncq_write_activ  => 'syncq_write_a',
+		asyncq_read_pend   => 'asyncq_read_p',  asyncq_read_activ  => 'asyncq_read_a',
+		asyncq_write_pend  => 'asyncq_write_p', asyncq_write_activ => 'asyncq_write_a',
+		scrubq_read_pend   => 'scrubq_read_p',  scrubq_read_activ  => 'scrubq_read_a',
+		trimq_write_pend   => 'trimq_write_p',  trimq_write_activ  => 'trimq_write_a',
+	);
+
+	foreach my $wire_name ( keys %iostat_field_alias ) {
+		if ( defined( $iostat_raw{$wire_name} ) ) {
+			$newPool{ $iostat_field_alias{$wire_name} } = $iostat_raw{$wire_name};
+		}
+	}
 
 	if ( $newPool{trim_wait} eq '-' ) {
 		$newPool{trim_wait} = 0;
